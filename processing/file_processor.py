@@ -2,10 +2,55 @@ import os
 import json
 import logging
 from tqdm.asyncio import tqdm
+import re
+from dotenv import load_dotenv
 
 from utils.pdf_processor import extract_text_and_tables_from_pdf
 from utils.drawing_processor import process_drawing
 from templates.room_templates import process_architectural_drawing
+from .panel_schedule_intelligence import PanelScheduleProcessor
+
+# Load environment variables
+load_dotenv()
+
+# Initialize panel schedule processor if credentials are available
+panel_processor = None
+AZURE_ENDPOINT = os.getenv("DOCUMENTINTELLIGENCE_ENDPOINT")
+AZURE_API_KEY = os.getenv("DOCUMENTINTELLIGENCE_API_KEY")
+
+if AZURE_ENDPOINT and AZURE_API_KEY:
+    panel_processor = PanelScheduleProcessor(endpoint=AZURE_ENDPOINT, api_key=AZURE_API_KEY)
+
+def is_panel_schedule(file_name: str, raw_content: str) -> bool:
+    """
+    Determine if a PDF is likely an electrical panel schedule.
+    
+    Args:
+        file_name (str): Name of the PDF file
+        raw_content (str): Extracted text content from the PDF
+        
+    Returns:
+        bool: True if the file appears to be a panel schedule
+    """
+    file_name_lower = file_name.lower()
+    content_lower = raw_content.lower()
+    
+    # Check filename patterns
+    filename_indicators = ["panel", "schedule", "pnl"]
+    if any(indicator in file_name_lower for indicator in filename_indicators):
+        return True
+    
+    # Check content patterns
+    content_indicators = [
+        r"panel\s+schedule",
+        r"circuit\s+breaker",
+        r"load\s+schedule",
+        r"branch\s+circuit",
+        r"\d+\s*[av]\s*,\s*\d+\s*[Øø]",  # Voltage/phase patterns
+        r"main\s+breaker"
+    ]
+    
+    return any(re.search(pattern, content_lower) for pattern in content_indicators)
 
 async def process_pdf_async(
     pdf_path,
@@ -16,17 +61,45 @@ async def process_pdf_async(
 ):
     """
     Process a single PDF asynchronously:
-      1) Extract text/tables.
-      2) Use GPT to convert data into structured JSON.
-      3) Save results to disk, possibly generate templates for Architectural PDFs.
+      1) For electrical panel schedules, use Azure Document Intelligence
+      2) For other drawings, use the standard GPT pipeline
     """
     file_name = os.path.basename(pdf_path)
     with tqdm(total=100, desc=f"Processing {file_name}", leave=False) as pbar:
         try:
             pbar.update(10)  # Start
             raw_content = await extract_text_and_tables_from_pdf(pdf_path)
-            
             pbar.update(20)  # PDF text/tables extracted
+
+            # Check if this is an electrical panel schedule
+            if drawing_type == "Electrical" and panel_processor and is_panel_schedule(file_name, raw_content):
+                logging.info(f"Detected electrical panel schedule in {file_name}. Using Azure Document Intelligence.")
+                
+                try:
+                    # Process with Azure Document Intelligence
+                    panel_data = await panel_processor.process_panel_schedule(pdf_path)
+                    pbar.update(40)  # Azure processing done
+                    
+                    # Save to PanelSchedules subfolder
+                    panel_folder = os.path.join(output_folder, "PanelSchedules")
+                    os.makedirs(panel_folder, exist_ok=True)
+                    
+                    output_filename = os.path.splitext(file_name)[0] + '_panel.json'
+                    output_path = os.path.join(panel_folder, output_filename)
+                    
+                    with open(output_path, 'w') as f:
+                        json.dump(panel_data, f, indent=2)
+                    
+                    pbar.update(30)  # JSON saved
+                    logging.info(f"Successfully processed panel schedule: {output_path}")
+                    return {"success": True, "file": output_path, "panel_schedule": True}
+                    
+                except Exception as e:
+                    logging.error(f"Azure Document Intelligence processing failed for {file_name}: {str(e)}")
+                    logging.info("Falling back to standard GPT processing...")
+                    # Continue with standard processing if Azure fails
+            
+            # Standard GPT processing for non-panel schedules or fallback
             structured_json = await process_drawing(raw_content, drawing_type, client)
             pbar.update(40)  # GPT processing done
             
@@ -52,7 +125,7 @@ async def process_pdf_async(
                     logging.info(f"Created room templates: {result}")
                 
                 pbar.update(10)  # Finishing
-                return {"success": True, "file": output_path}
+                return {"success": True, "file": output_path, "panel_schedule": False}
             
             except json.JSONDecodeError as e:
                 pbar.update(100)
