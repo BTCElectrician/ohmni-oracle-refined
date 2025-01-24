@@ -8,6 +8,7 @@ venv/
 logs/
 output/
 workplan.md
+UPGRADE-DOCU-INT.md
 
 # Virtual Environment
 ENV/

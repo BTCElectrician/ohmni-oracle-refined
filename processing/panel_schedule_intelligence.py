@@ -1,4 +1,3 @@
-
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 import logging
@@ -6,6 +5,9 @@ import os
 import json
 import asyncio
 from typing import Dict, List
+import re
+
+PANEL_NAME_PATTERN = re.compile(r'^[A-Z]{1,3}\d{1,3}$')
 
 class PanelScheduleProcessor:
     """
@@ -47,120 +49,198 @@ class PanelScheduleProcessor:
                 content_type="application/pdf"
             )
             result = poller.result()
+            self.logger.info(f"DEBUG: Azure analysis complete for {file_path}")
 
-            # Extract structured data from the result
-            panel_data = self._extract_panel_data(result)
-            circuit_data = self._extract_circuit_data(result)
-            specs = self._extract_specifications(result)
-            revisions = self._extract_revisions(result)
+            # Extract core panel data
+            extracted_data = self._extract_panel_data(result)
+            # Extract circuit information
+            circuit_info = self._extract_circuit_data(result)
 
-            # Return a dict that can be serialized to JSON
-            return {
-                "panel": {
-                    **panel_data,
-                    "specifications": specs,
-                    "circuits": circuit_data,
-                    "revisions": revisions
-                }
+            # Combine into final structure
+            final_output = {
+                "PanelName": extracted_data.get("PanelName", ""),
+                "GenericPanelTypes": {
+                    "LoadCenter": extracted_data.get("LoadCenter", {}),
+                    "MainPanel": extracted_data.get("MainPanel", {}),
+                    "DistributionPanel": extracted_data.get("DistributionPanel", {})
+                },
+                "circuits": circuit_info
             }
 
+            return final_output
+
         except Exception as e:
-            self.logger.error(f"Error processing panel schedule {file_path}: {str(e)}")
+            self.logger.exception(f"Azure Document Intelligence processing failed for {file_path}")
             raise
 
     def _extract_panel_data(self, result) -> Dict:
-        """Extract basic panel metadata from the document."""
-        panel_data = {
-            "name": "",
-            "voltage": "",
-            "phases": None,
-            "rating": "",
-            "main_type": ""
+        """
+        Extract panel data according to the new schema structure.
+        """
+        self.logger.info("DEBUG: Entering _extract_panel_data method")
+
+        # Log recognized documents & fields
+        if hasattr(result, "documents"):
+            self.logger.info(f"DEBUG: Found {len(result.documents)} document(s)")
+            for i, doc in enumerate(result.documents):
+                self.logger.info(f"DEBUG: Document {i} => {len(doc.fields)} fields")
+                for field_name, field_value in doc.fields.items():
+                    self.logger.info(f"Field '{field_name}' => '{field_value.value}' (conf={field_value.confidence})")
+
+        # Initialize the new schema structure
+        parsed_data = {
+            "PanelName": "",
+            "LoadCenter": {
+                "panelboard_schedule": {
+                    "designation": "",
+                    "main_type": "",
+                    "mounting": "",
+                    "branch_ocp_type": "",
+                    "voltage": "",
+                    "circuits": {
+                        "circuit_no": "",
+                        "description": "",
+                        "ocp": "",
+                        "room_id": []
+                    }
+                }
+            },
+            "MainPanel": {
+                "panel": {
+                    "name": "",
+                    "voltage": "",
+                    "feed": "",
+                    "marks": None,
+                    "specifications": {
+                        "sections": "",
+                        "nema_enclosure": "",
+                        "amps": "",
+                        "phases": "",
+                        "voltage": "",
+                        "frequency": "",
+                        "interrupt_rating": "",
+                        "incoming_feed": "",
+                        "mounting": "",
+                        "circuits_count": 0,
+                        "dimensions": {
+                            "height": "",
+                            "width": "",
+                            "depth": ""
+                        },
+                        "main_breaker_rating": None,
+                        "main_lugs_rating": None
+                    },
+                    "circuits": {
+                        "circuit": "",
+                        "circuit_range": None,
+                        "load_name": "",
+                        "trip": "",
+                        "poles": None,
+                        "equipment_ref": None,
+                        "equipment_refs": []
+                    },
+                    "panel_totals": {
+                        "total_connected_load": None,
+                        "total_estimated_demand": None,
+                        "total_connected_amps": None,
+                        "total_estimated_demand_amps": None
+                    }
+                }
+            },
+            "DistributionPanel": {
+                "marks": {
+                    "section": "",
+                    "amps": "",
+                    "interrupt_rating": "",
+                    "feed": "",
+                    "circuits": "",
+                    "certifications": [],
+                    "dimensions": {
+                        "height": "",
+                        "width": "",
+                        "depth": ""
+                    },
+                    "breaker": ""
+                },
+                "panel": {
+                    "name": "",
+                    "voltage": "",
+                    "feed": "",
+                    "location": None,
+                    "phases": None,
+                    "aic_rating": None,
+                    "type": None,
+                    "rating": None,
+                    "circuits": {
+                        "circuit": "",
+                        "load_name": "",
+                        "trip": "",
+                        "poles": "",
+                        "equipment_ref": None
+                    }
+                }
+            }
         }
-        
+
         # Process tables to find panel information
         for table in result.tables:
             for cell in table.cells:
                 text = cell.content.lower()
-                if "panel" in text or "name" in text:
-                    # Look for adjacent cell with panel name
-                    panel_data["name"] = self._get_adjacent_cell_value(table, cell)
-                elif "voltage" in text:
-                    panel_data["voltage"] = self._get_adjacent_cell_value(table, cell)
-                elif "phase" in text:
-                    phase_text = self._get_adjacent_cell_value(table, cell)
-                    try:
-                        panel_data["phases"] = int(phase_text.split()[0])
-                    except (ValueError, IndexError):
-                        pass
-                elif "rating" in text or "amp" in text:
-                    panel_data["rating"] = self._get_adjacent_cell_value(table, cell)
-                elif "main" in text and ("type" in text or "breaker" in text):
-                    panel_data["main_type"] = self._get_adjacent_cell_value(table, cell)
-        
-        return panel_data
+                
+                # Check for panel name pattern
+                if PANEL_NAME_PATTERN.match(cell.content.strip()):
+                    parsed_data["PanelName"] = cell.content.strip()
+                    self.logger.info(f"Regex match: Found panel name '{cell.content.strip()}'")
+
+                # Process other fields based on content
+                self._process_table_cell(parsed_data, text, table, cell)
+
+        return parsed_data
+
+    def _process_table_cell(self, parsed_data: Dict, text: str, table, cell):
+        """Helper method to process individual table cells and update parsed_data"""
+        try:
+            if "main" in text and "panel" in text:
+                parsed_data["MainPanel"]["panel"]["type"] = "MainPanel"
+                next_val = self._get_adjacent_cell_value(table, cell)
+                if next_val:
+                    parsed_data["MainPanel"]["panel"]["name"] = next_val
+            
+            elif "distribution" in text and "panel" in text:
+                parsed_data["DistributionPanel"]["panel"]["type"] = "DistributionPanel"
+                next_val = self._get_adjacent_cell_value(table, cell)
+                if next_val:
+                    parsed_data["DistributionPanel"]["panel"]["name"] = next_val
+            
+            elif "load center" in text:
+                parsed_data["LoadCenter"]["panelboard_schedule"]["designation"] = "LoadCenter"
+                next_val = self._get_adjacent_cell_value(table, cell)
+                if next_val:
+                    parsed_data["LoadCenter"]["panelboard_schedule"]["designation"] = next_val
+
+        except Exception as e:
+            self.logger.error(f"Error processing table cell: {str(e)}")
 
     def _extract_circuit_data(self, result) -> List[Dict]:
-        """Extract circuit information from the document tables."""
+        """
+        Extract circuit information from the document tables.
+        """
+        self.logger.info("DEBUG: Entering _extract_circuit_data method")
         circuits = []
-        
-        for table in result.tables:
-            # Look for tables with circuit information
-            if self._is_circuit_table(table):
-                header_row = self._get_header_row(table)
-                if not header_row:
-                    continue
+
+        if hasattr(result, "tables"):
+            for t_idx, table in enumerate(result.tables):
+                self.logger.info(f"DEBUG: Table {t_idx} has {len(table.cells)} cells")
                 
-                # Process each row as a circuit
-                for row_idx in range(header_row + 1, len(table.cells)):
-                    circuit = self._process_circuit_row(table, row_idx, header_row)
-                    if circuit:
-                        circuits.append(circuit)
-        
+                if self._is_circuit_table(table):
+                    header_row = self._get_header_row(table)
+                    if header_row >= 0:
+                        for row_idx in range(header_row + 1, len(table.cells)):
+                            circuit = self._process_circuit_row(table, row_idx, header_row)
+                            if circuit:
+                                circuits.append(circuit)
+
         return circuits
-
-    def _extract_specifications(self, result) -> Dict:
-        """Extract panel specifications from the document."""
-        specs = {
-            "sections": "",
-            "nema_enclosure": "",
-            "amps": "",
-            "phases": "",
-            "voltage": "",
-            "frequency": "",
-            "dimensions": {
-                "height": "",
-                "width": "",
-                "depth": ""
-            }
-        }
-        
-        # Process text and tables for specifications
-        for table in result.tables:
-            for cell in table.cells:
-                text = cell.content.lower()
-                if "nema" in text:
-                    specs["nema_enclosure"] = self._get_adjacent_cell_value(table, cell)
-                elif "section" in text:
-                    specs["sections"] = self._get_adjacent_cell_value(table, cell)
-                elif "dimension" in text or "size" in text:
-                    dim_text = self._get_adjacent_cell_value(table, cell)
-                    self._parse_dimensions(dim_text, specs["dimensions"])
-        
-        return specs
-
-    def _extract_revisions(self, result) -> List[Dict]:
-        """Extract revision history if present in the document."""
-        revisions = []
-        
-        for table in result.tables:
-            if self._is_revision_table(table):
-                for row_idx in range(1, len(table.cells)):
-                    revision = self._process_revision_row(table, row_idx)
-                    if revision:
-                        revisions.append(revision)
-        
-        return revisions
 
     def _get_adjacent_cell_value(self, table, cell) -> str:
         """Helper method to get the value from an adjacent cell."""

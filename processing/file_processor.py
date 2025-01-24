@@ -23,34 +23,27 @@ if AZURE_ENDPOINT and AZURE_API_KEY:
 
 def is_panel_schedule(file_name: str, raw_content: str) -> bool:
     """
-    Determine if a PDF is likely an electrical panel schedule.
+    Determine if a PDF is likely an electrical panel schedule
+    based solely on the file name (no numeric or content checks).
     
     Args:
         file_name (str): Name of the PDF file
-        raw_content (str): Extracted text content from the PDF
+        raw_content (str): (Unused) Extracted text content from the PDF
         
     Returns:
-        bool: True if the file appears to be a panel schedule
+        bool: True if the file name contains certain panel-schedule keywords
     """
-    file_name_lower = file_name.lower()
-    content_lower = raw_content.lower()
-    
-    # Check filename patterns
-    filename_indicators = ["panel", "schedule", "pnl"]
-    if any(indicator in file_name_lower for indicator in filename_indicators):
-        return True
-    
-    # Check content patterns
-    content_indicators = [
-        r"panel\s+schedule",
-        r"circuit\s+breaker",
-        r"load\s+schedule",
-        r"branch\s+circuit",
-        r"\d+\s*[av]\s*,\s*\d+\s*[Øø]",  # Voltage/phase patterns
-        r"main\s+breaker"
+    # We skip numeric references entirely and rely on these keywords:
+    panel_keywords = [
+        "electrical panel schedule",
+        "panel schedule",
+        "panel schedules",
+        "power schedule",
+        "lighting schedule"
     ]
+    file_name_lower = file_name.lower()
     
-    return any(re.search(pattern, content_lower) for pattern in content_indicators)
+    return any(keyword in file_name_lower for keyword in panel_keywords)
 
 async def process_pdf_async(
     pdf_path,
