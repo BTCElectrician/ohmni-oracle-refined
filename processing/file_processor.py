@@ -33,13 +33,19 @@ def is_panel_schedule(file_name: str, raw_content: str) -> bool:
     Returns:
         bool: True if the file name contains certain panel-schedule keywords
     """
-    # We skip numeric references entirely and rely on these keywords:
+    # We skip numeric references entirely and rely on these keywords (both spaced and hyphenated):
     panel_keywords = [
         "electrical panel schedule",
         "panel schedule",
         "panel schedules",
         "power schedule",
-        "lighting schedule"
+        "lighting schedule",
+        # ADDITIONAL HYPHENATED VERSIONS:
+        "electrical-panel-schedule",
+        "panel-schedule",
+        "panel-schedules",
+        "power-schedule",
+        "lighting-schedule"
     ]
     file_name_lower = file_name.lower()
     
