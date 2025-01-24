@@ -12,18 +12,10 @@ PANEL_NAME_PATTERN = re.compile(r'^[A-Z]{1,3}\d{1,3}$')
 class PanelScheduleProcessor:
     """
     Azure Document Intelligence processor specifically for electrical panel schedules.
-    Designed to be integrated into the document processing pipeline.
+    Uses the "prebuilt-layout" model to retrieve pages, tables, etc.
     """
-    
+
     def __init__(self, endpoint: str, api_key: str, **kwargs):
-        """
-        Initialize the processor with Azure credentials.
-        
-        Args:
-            endpoint (str): Azure Document Intelligence endpoint
-            api_key (str): Azure Document Intelligence key
-            **kwargs: Additional configuration options (e.g., batch_size, timeout, etc.)
-        """
         self.client = DocumentIntelligenceClient(
             endpoint=endpoint,
             credential=AzureKeyCredential(api_key)
@@ -35,14 +27,26 @@ class PanelScheduleProcessor:
     async def process_panel_schedule(self, file_path: str) -> Dict:
         """
         Process a single panel schedule PDF using Azure Document Intelligence
-        and return structured information as a Python dict.
+        and return structured information as a Python dict (even if partially empty).
         """
+        # A fallback in case we encounter an error
+        fallback_output = {
+            "PanelName": "",
+            "GenericPanelTypes": {
+                "LoadCenter": {},
+                "MainPanel": {},
+                "DistributionPanel": {}
+            },
+            "circuits": [],
+            "error": None
+        }
+
         try:
-            # Read PDF bytes
+            # 1) Read PDF
             with open(file_path, "rb") as f:
                 document_bytes = f.read()
 
-            # Call Azure prebuilt-layout model
+            # 2) Call Azure prebuilt-layout model
             poller = self.client.begin_analyze_document(
                 "prebuilt-layout",
                 document_bytes,
@@ -51,12 +55,10 @@ class PanelScheduleProcessor:
             result = poller.result()
             self.logger.info(f"DEBUG: Azure analysis complete for {file_path}")
 
-            # Extract core panel data
+            # 3) Extract data from 'result'
             extracted_data = self._extract_panel_data(result)
-            # Extract circuit information
             circuit_info = self._extract_circuit_data(result)
 
-            # Combine into final structure
             final_output = {
                 "PanelName": extracted_data.get("PanelName", ""),
                 "GenericPanelTypes": {
@@ -64,30 +66,31 @@ class PanelScheduleProcessor:
                     "MainPanel": extracted_data.get("MainPanel", {}),
                     "DistributionPanel": extracted_data.get("DistributionPanel", {})
                 },
-                "circuits": circuit_info
+                "circuits": circuit_info,
+                "error": None
             }
-
             return final_output
 
         except Exception as e:
+            # If anything fails, we still return a partial JSON with an error message
             self.logger.exception(f"Azure Document Intelligence processing failed for {file_path}")
-            raise
+            fallback_output["error"] = str(e)
+            return fallback_output
 
     def _extract_panel_data(self, result) -> Dict:
         """
-        Extract panel data according to the new schema structure.
+        Extract panel data from the 'prebuilt-layout' result.
+        We focus on 'tables' because 'documents' is often None for layout models.
         """
         self.logger.info("DEBUG: Entering _extract_panel_data method")
 
-        # Log recognized documents & fields
-        if hasattr(result, "documents"):
+        # If the layout engine recognized any 'documents'
+        if getattr(result, "documents", None) is not None:
             self.logger.info(f"DEBUG: Found {len(result.documents)} document(s)")
-            for i, doc in enumerate(result.documents):
-                self.logger.info(f"DEBUG: Document {i} => {len(doc.fields)} fields")
-                for field_name, field_value in doc.fields.items():
-                    self.logger.info(f"Field '{field_name}' => '{field_value.value}' (conf={field_value.confidence})")
+        else:
+            self.logger.info("DEBUG: No 'documents' found in the result. (Normal for prebuilt-layout)")
 
-        # Initialize the new schema structure
+        # Build default structure
         parsed_data = {
             "PanelName": "",
             "LoadCenter": {
@@ -182,23 +185,132 @@ class PanelScheduleProcessor:
             }
         }
 
-        # Process tables to find panel information
+        # 1) If no tables found, we can't do much
+        if not hasattr(result, "tables") or not result.tables:
+            self.logger.warning("No tables found in layout result.")
+            return parsed_data
+
+        # 2) Parse each table cell
         for table in result.tables:
+            # table.cells is a flat list of DocumentTableCell objects
             for cell in table.cells:
-                text = cell.content.lower()
-                
-                # Check for panel name pattern
+                text_lower = cell.content.lower().strip()
+
+                # Regex check for panel name
                 if PANEL_NAME_PATTERN.match(cell.content.strip()):
                     parsed_data["PanelName"] = cell.content.strip()
                     self.logger.info(f"Regex match: Found panel name '{cell.content.strip()}'")
 
-                # Process other fields based on content
-                self._process_table_cell(parsed_data, text, table, cell)
+                # For main panel, distribution panel, load center logic
+                self._process_table_cell(parsed_data, text_lower, table, cell)
 
         return parsed_data
 
+    def _extract_circuit_data(self, result) -> List[Dict]:
+        """
+        Extract circuit rows from the recognized tables (if any).
+        We'll guess which table is a "circuit table" using keywords in row 0.
+        """
+        self.logger.info("DEBUG: Entering _extract_circuit_data method")
+        circuits = []
+
+        if not hasattr(result, "tables") or not result.tables:
+            self.logger.warning("No tables attribute or empty tables. Returning no circuits.")
+            return circuits
+
+        # Iterate all recognized tables
+        for t_idx, table in enumerate(result.tables):
+            self.logger.info(f"DEBUG: Table {t_idx} has {len(table.cells)} cells, row_count={table.row_count}, col_count={table.column_count}")
+
+            # If we think it's a circuit table
+            if self._is_circuit_table(table):
+                # 1) Identify which row is the header (circuit/breaker/etc.)
+                header_row_idx = self._get_header_row(table)
+                if header_row_idx < 0:
+                    self.logger.info("No suitable header row found. Skipping table.")
+                    continue
+
+                # 2) For each row after header_row_idx, parse circuit data
+                for row_idx in range(header_row_idx + 1, table.row_count):
+                    circuit = self._process_circuit_row(table, row_idx, header_row_idx)
+                    if circuit:
+                        circuits.append(circuit)
+
+        return circuits
+
+    def _is_circuit_table(self, table) -> bool:
+        """
+        Determine if a table looks like a circuit table by checking row 0 text
+        for keywords like 'circuit', 'breaker', 'amp', 'pole', 'load'.
+        """
+        keywords = ["circuit", "breaker", "load", "amp", "pole"]
+        # Collect all cells in row 0
+        row0_cells = [c for c in table.cells if c.row_index == 0]
+        header_text = " ".join(c.content.lower() for c in row0_cells)
+
+        return any(keyword in header_text for keyword in keywords)
+
+    def _get_header_row(self, table) -> int:
+        """
+        Find a row that includes 'circuit' and either 'breaker' or 'load'.
+        If none is found, return -1.
+        """
+        for row_idx in range(table.row_count):
+            row_cells = [c for c in table.cells if c.row_index == row_idx]
+            row_text = " ".join(cell.content.lower() for cell in row_cells)
+
+            if "circuit" in row_text and ("breaker" in row_text or "load" in row_text):
+                return row_idx
+
+        return -1
+
+    def _process_circuit_row(self, table, row_idx: int, header_row_idx: int) -> Dict:
+        """
+        Map each cell in the row to its 'header' cell. We rely on column_index to match them up.
+        Return a dictionary describing the circuit if we get a 'circuit number', else None.
+        """
+        row_cells = [c for c in table.cells if c.row_index == row_idx]
+        header_cells = [c for c in table.cells if c.row_index == header_row_idx]
+
+        # Sort by column_index so they line up
+        row_cells_sorted = sorted(row_cells, key=lambda x: x.column_index)
+        header_cells_sorted = sorted(header_cells, key=lambda x: x.column_index)
+
+        circuit = {
+            "number": "",
+            "poles": "",
+            "breaker_size": "",
+            "load_description": "",
+            "load_kva": "",
+            "phase": ""
+        }
+
+        # For each column, see if the header cell has a matching keyword
+        for col_idx, cell_data in enumerate(row_cells_sorted):
+            if col_idx < len(header_cells_sorted):
+                header_text = header_cells_sorted[col_idx].content.lower()
+                value = cell_data.content.strip()
+
+                if "circuit" in header_text or "no" in header_text:
+                    circuit["number"] = value
+                elif "pole" in header_text:
+                    circuit["poles"] = value
+                elif "breaker" in header_text or "amp" in header_text:
+                    circuit["breaker_size"] = value
+                elif "description" in header_text or "load" in header_text:
+                    circuit["load_description"] = value
+                elif "kva" in header_text:
+                    circuit["load_kva"] = value
+                elif "phase" in header_text:
+                    circuit["phase"] = value
+
+        return circuit if circuit["number"] else None
+
     def _process_table_cell(self, parsed_data: Dict, text: str, table, cell):
-        """Helper method to process individual table cells and update parsed_data"""
+        """
+        Helper method to detect references like 'Main Panel', 'Distribution Panel', 'Load Center'.
+        We then grab the next cell's content (i.e., to the right) as the "panel name" or similar.
+        """
         try:
             if "main" in text and "panel" in text:
                 parsed_data["MainPanel"]["panel"]["type"] = "MainPanel"
@@ -221,133 +333,19 @@ class PanelScheduleProcessor:
         except Exception as e:
             self.logger.error(f"Error processing table cell: {str(e)}")
 
-    def _extract_circuit_data(self, result) -> List[Dict]:
-        """
-        Extract circuit information from the document tables.
-        """
-        self.logger.info("DEBUG: Entering _extract_circuit_data method")
-        circuits = []
-
-        if hasattr(result, "tables"):
-            for t_idx, table in enumerate(result.tables):
-                self.logger.info(f"DEBUG: Table {t_idx} has {len(table.cells)} cells")
-                
-                if self._is_circuit_table(table):
-                    header_row = self._get_header_row(table)
-                    if header_row >= 0:
-                        for row_idx in range(header_row + 1, len(table.cells)):
-                            circuit = self._process_circuit_row(table, row_idx, header_row)
-                            if circuit:
-                                circuits.append(circuit)
-
-        return circuits
-
     def _get_adjacent_cell_value(self, table, cell) -> str:
-        """Helper method to get the value from an adjacent cell."""
-        try:
-            next_cell = table.cells[cell.row_index][cell.column_index + 1]
-            return next_cell.content.strip()
-        except IndexError:
-            return ""
+        """
+        Try to find the cell in the same row, next column over. If missing, return "".
+        Because table.cells is flat, filter by row_index then find column_index + 1.
+        """
+        row_idx = cell.row_index
+        col_idx = cell.column_index + 1
 
-    def _is_circuit_table(self, table) -> bool:
-        """Determine if a table contains circuit information."""
-        keywords = ["circuit", "breaker", "load", "amp", "pole"]
-        header_text = " ".join(cell.content.lower() for cell in table.cells[0])
-        return any(keyword in header_text for keyword in keywords)
+        # Find a cell that matches (row_idx, col_idx)
+        next_cell = next(
+            (c for c in table.cells if c.row_index == row_idx and c.column_index == col_idx),
+            None
+        )
+        return next_cell.content.strip() if next_cell else ""
 
-    def _get_header_row(self, table) -> int:
-        """Find the header row index in a table."""
-        for row_idx, row in enumerate(table.cells):
-            row_text = " ".join(cell.content.lower() for cell in row)
-            if "circuit" in row_text and ("breaker" in row_text or "load" in row_text):
-                return row_idx
-        return -1
-
-    def _process_circuit_row(self, table, row_idx: int, header_row: int) -> Dict:
-        """Process a single circuit row from the table."""
-        try:
-            row = table.cells[row_idx]
-            headers = [cell.content.lower() for cell in table.cells[header_row]]
-            
-            circuit = {
-                "number": "",
-                "poles": "",
-                "breaker_size": "",
-                "load_description": "",
-                "load_kva": "",
-                "phase": ""
-            }
-            
-            for col_idx, cell in enumerate(row):
-                header = headers[col_idx] if col_idx < len(headers) else ""
-                value = cell.content.strip()
-                
-                if "circuit" in header or "no" in header:
-                    circuit["number"] = value
-                elif "pole" in header:
-                    circuit["poles"] = value
-                elif "breaker" in header or "amp" in header:
-                    circuit["breaker_size"] = value
-                elif "description" in header or "load" in header:
-                    circuit["load_description"] = value
-                elif "kva" in header:
-                    circuit["load_kva"] = value
-                elif "phase" in header:
-                    circuit["phase"] = value
-            
-            return circuit if circuit["number"] else None
-            
-        except Exception as e:
-            self.logger.error(f"Error processing circuit row: {str(e)}")
-            return None
-
-    def _is_revision_table(self, table) -> bool:
-        """Determine if a table contains revision information."""
-        keywords = ["revision", "rev", "date", "description", "by"]
-        header_text = " ".join(cell.content.lower() for cell in table.cells[0])
-        return any(keyword in header_text for keyword in keywords)
-
-    def _process_revision_row(self, table, row_idx: int) -> Dict:
-        """Process a single revision row from the table."""
-        try:
-            row = table.cells[row_idx]
-            revision = {
-                "revision": "",
-                "date": "",
-                "description": "",
-                "by": ""
-            }
-            
-            for cell in row:
-                text = cell.content.lower().strip()
-                if text:
-                    if "rev" in text:
-                        revision["revision"] = text
-                    elif self._is_date(text):
-                        revision["date"] = text
-                    elif len(text) <= 3:  # Likely initials
-                        revision["by"] = text
-                    else:
-                        revision["description"] = text
-            
-            return revision if any(revision.values()) else None
-            
-        except Exception as e:
-            self.logger.error(f"Error processing revision row: {str(e)}")
-            return None
-
-    def _is_date(self, text: str) -> bool:
-        """Simple helper to check if text might be a date."""
-        return any(char.isdigit() for char in text) and ("/" in text or "-" in text)
-
-    def _parse_dimensions(self, dim_text: str, dimensions: Dict) -> None:
-        """Parse dimension text into height, width, depth values."""
-        try:
-            parts = dim_text.lower().split("x")
-            if len(parts) >= 3:
-                dimensions["height"] = parts[0].strip()
-                dimensions["width"] = parts[1].strip()
-                dimensions["depth"] = parts[2].strip()
-        except Exception:
-            pass 
+    # The revision or date processing can remain as-is or be removed if not needed.
