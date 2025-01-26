@@ -1,35 +1,68 @@
+# processing/panel_schedule_intelligence.py
+
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
-import logging
 import os
+import logging
 import json
-import asyncio
 from typing import Dict, List
 import re
 
+# NEW: Use the AsyncOpenAI client
+from openai import AsyncOpenAI
+
+# Optional regex for typical panel name patterns like "L1", "H2", "A125", etc.
 PANEL_NAME_PATTERN = re.compile(r'^[A-Z]{1,3}\d{1,3}$')
 
 class PanelScheduleProcessor:
     """
-    Azure Document Intelligence processor specifically for electrical panel schedules.
-    Uses the "prebuilt-layout" model to retrieve pages, tables, etc.
+    Processes an electrical panel schedule PDF using:
+      1) Azure Document Intelligence (prebuilt-layout) to extract tables
+      2) GPT to interpret table columns (header row) and map them to circuit fields
     """
 
     def __init__(self, endpoint: str, api_key: str, **kwargs):
-        self.client = DocumentIntelligenceClient(
+        """
+        :param endpoint: Azure Document Intelligence endpoint URL
+        :param api_key: Azure Document Intelligence API key
+        :param kwargs: optional arguments for config (batch_size, timeout, etc.)
+        """
+        self.logger = logging.getLogger(__name__)
+
+        # Azure Document Intelligence client
+        self.document_client = DocumentIntelligenceClient(
             endpoint=endpoint,
             credential=AzureKeyCredential(api_key)
         )
-        self.logger = logging.getLogger(__name__)
+
+        # GPT (OpenAI) configuration
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        if not self.openai_api_key:
+            raise ValueError("OPENAI_API_KEY must be set for GPT usage.")
+
+        # NEW: Initialize the async OpenAI client
+        self.client = AsyncOpenAI(api_key=self.openai_api_key)
+
+        # Optional custom settings
         self.batch_size = kwargs.get('batch_size', 1)
         self.timeout = kwargs.get('timeout', 300)
 
     async def process_panel_schedule(self, file_path: str) -> Dict:
         """
-        Process a single panel schedule PDF using Azure Document Intelligence
-        and return structured information as a Python dict (even if partially empty).
+        Main entry point: parse a panel schedule PDF into a structured dict.
+
+        Returns a structure like:
+        {
+          "PanelName": "L1",
+          "GenericPanelTypes": {
+             "LoadCenter": {...},
+             "MainPanel": {...},
+             "DistributionPanel": {...}
+          },
+          "circuits": [...],   # array of circuit objects
+          "error": None or "some error message"
+        }
         """
-        # A fallback in case we encounter an error
         fallback_output = {
             "PanelName": "",
             "GenericPanelTypes": {
@@ -42,22 +75,24 @@ class PanelScheduleProcessor:
         }
 
         try:
-            # 1) Read PDF
+            # Read the PDF file as bytes
             with open(file_path, "rb") as f:
-                document_bytes = f.read()
+                pdf_bytes = f.read()
 
-            # 2) Call Azure prebuilt-layout model
-            poller = self.client.begin_analyze_document(
+            # 1) Analyze the PDF with Azure Document Intelligence (prebuilt-layout)
+            poller = self.document_client.begin_analyze_document(
                 "prebuilt-layout",
-                document_bytes,
+                pdf_bytes,
                 content_type="application/pdf"
             )
             result = poller.result()
             self.logger.info(f"DEBUG: Azure analysis complete for {file_path}")
 
-            # 3) Extract data from 'result'
+            # 2) Extract any top-level panel data (like PanelName)
             extracted_data = self._extract_panel_data(result)
-            circuit_info = self._extract_circuit_data(result)
+
+            # 3) Use GPT to interpret each table’s header and map the data into circuit objects
+            circuit_info = await self._extract_circuit_data_with_gpt(result)
 
             final_output = {
                 "PanelName": extracted_data.get("PanelName", ""),
@@ -72,280 +107,179 @@ class PanelScheduleProcessor:
             return final_output
 
         except Exception as e:
-            # If anything fails, we still return a partial JSON with an error message
-            self.logger.exception(f"Azure Document Intelligence processing failed for {file_path}")
+            self.logger.exception(f"Azure/GPT processing failed for {file_path}")
             fallback_output["error"] = str(e)
             return fallback_output
 
     def _extract_panel_data(self, result) -> Dict:
         """
-        Extract panel data from the 'prebuilt-layout' result.
-        We focus on 'tables' because 'documents' is often None for layout models.
+        Scans recognized tables for a possible panel name or any top-level data.
+        Returns a dict with:
+          "PanelName": "L1" (if found)
+          "LoadCenter": {...}, "MainPanel": {...}, "DistributionPanel": {...}
+        (You can expand or customize as needed.)
         """
         self.logger.info("DEBUG: Entering _extract_panel_data method")
 
-        # If the layout engine recognized any 'documents'
-        if getattr(result, "documents", None) is not None:
-            self.logger.info(f"DEBUG: Found {len(result.documents)} document(s)")
-        else:
-            self.logger.info("DEBUG: No 'documents' found in the result. (Normal for prebuilt-layout)")
-
-        # Build default structure
+        # Basic default structure
         parsed_data = {
             "PanelName": "",
             "LoadCenter": {
-                "panelboard_schedule": {
-                    "designation": "",
-                    "main_type": "",
-                    "mounting": "",
-                    "branch_ocp_type": "",
-                    "voltage": "",
-                    "circuits": {
-                        "circuit_no": "",
-                        "description": "",
-                        "ocp": "",
-                        "room_id": []
-                    }
-                }
+                "panelboard_schedule": {}
             },
             "MainPanel": {
-                "panel": {
-                    "name": "",
-                    "voltage": "",
-                    "feed": "",
-                    "marks": None,
-                    "specifications": {
-                        "sections": "",
-                        "nema_enclosure": "",
-                        "amps": "",
-                        "phases": "",
-                        "voltage": "",
-                        "frequency": "",
-                        "interrupt_rating": "",
-                        "incoming_feed": "",
-                        "mounting": "",
-                        "circuits_count": 0,
-                        "dimensions": {
-                            "height": "",
-                            "width": "",
-                            "depth": ""
-                        },
-                        "main_breaker_rating": None,
-                        "main_lugs_rating": None
-                    },
-                    "circuits": {
-                        "circuit": "",
-                        "circuit_range": None,
-                        "load_name": "",
-                        "trip": "",
-                        "poles": None,
-                        "equipment_ref": None,
-                        "equipment_refs": []
-                    },
-                    "panel_totals": {
-                        "total_connected_load": None,
-                        "total_estimated_demand": None,
-                        "total_connected_amps": None,
-                        "total_estimated_demand_amps": None
-                    }
-                }
+                "panel": {}
             },
             "DistributionPanel": {
-                "marks": {
-                    "section": "",
-                    "amps": "",
-                    "interrupt_rating": "",
-                    "feed": "",
-                    "circuits": "",
-                    "certifications": [],
-                    "dimensions": {
-                        "height": "",
-                        "width": "",
-                        "depth": ""
-                    },
-                    "breaker": ""
-                },
-                "panel": {
-                    "name": "",
-                    "voltage": "",
-                    "feed": "",
-                    "location": None,
-                    "phases": None,
-                    "aic_rating": None,
-                    "type": None,
-                    "rating": None,
-                    "circuits": {
-                        "circuit": "",
-                        "load_name": "",
-                        "trip": "",
-                        "poles": "",
-                        "equipment_ref": None
-                    }
-                }
+                "panel": {}
             }
         }
 
-        # 1) If no tables found, we can't do much
+        # If no tables recognized, nothing more we can do here
         if not hasattr(result, "tables") or not result.tables:
-            self.logger.warning("No tables found in layout result.")
+            self.logger.warning("No tables in result. No panel name found.")
             return parsed_data
 
-        # 2) Parse each table cell
+        # Optionally: Attempt to detect "PanelName" by scanning each cell with a regex
         for table in result.tables:
-            # table.cells is a flat list of DocumentTableCell objects
             for cell in table.cells:
-                text_lower = cell.content.lower().strip()
-
-                # Regex check for panel name
-                if PANEL_NAME_PATTERN.match(cell.content.strip()):
-                    parsed_data["PanelName"] = cell.content.strip()
-                    self.logger.info(f"Regex match: Found panel name '{cell.content.strip()}'")
-
-                # For main panel, distribution panel, load center logic
-                self._process_table_cell(parsed_data, text_lower, table, cell)
+                text = cell.content.strip()
+                if PANEL_NAME_PATTERN.match(text):
+                    parsed_data["PanelName"] = text
+                    self.logger.info(f"Found panel name: {text}")
+                    # break after first match, or remove if you want multiple matches
+                    return parsed_data
 
         return parsed_data
 
-    def _extract_circuit_data(self, result) -> List[Dict]:
+    async def _extract_circuit_data_with_gpt(self, result) -> List[Dict]:
         """
-        Extract circuit rows from the recognized tables (if any).
-        We'll guess which table is a "circuit table" using keywords in row 0.
+        Iterates over recognized tables. For each table:
+          1) Identify which row is likely the header row
+          2) Ask GPT to map those header columns to a known set of fields
+          3) Parse all subsequent rows into circuit objects using that mapping
+
+        Returns a list of circuit dictionaries.
         """
-        self.logger.info("DEBUG: Entering _extract_circuit_data method")
         circuits = []
 
         if not hasattr(result, "tables") or not result.tables:
-            self.logger.warning("No tables attribute or empty tables. Returning no circuits.")
+            self.logger.info("No tables found in result. Returning empty circuit list.")
             return circuits
 
-        # Iterate all recognized tables
         for t_idx, table in enumerate(result.tables):
-            self.logger.info(f"DEBUG: Table {t_idx} has {len(table.cells)} cells, row_count={table.row_count}, col_count={table.column_count}")
+            self.logger.info(f"Analyzing table {t_idx} with row_count={table.row_count}, col_count={table.column_count}")
 
-            # If we think it's a circuit table
-            if self._is_circuit_table(table):
-                # 1) Identify which row is the header (circuit/breaker/etc.)
-                header_row_idx = self._get_header_row(table)
-                if header_row_idx < 0:
-                    self.logger.info("No suitable header row found. Skipping table.")
-                    continue
+            # (A) Choose a "header row"—here, we'll pick whichever row has the most text
+            header_row_idx = self._guess_header_row(table)
+            if header_row_idx < 0:
+                self.logger.info("No plausible header row. Skipping this table.")
+                continue
 
-                # 2) For each row after header_row_idx, parse circuit data
-                for row_idx in range(header_row_idx + 1, table.row_count):
-                    circuit = self._process_circuit_row(table, row_idx, header_row_idx)
-                    if circuit:
-                        circuits.append(circuit)
+            # (B) Gather the text of the header row into a list
+            header_cells = [c for c in table.cells if c.row_index == header_row_idx]
+            header_cells_sorted = sorted(header_cells, key=lambda x: x.column_index)
+            header_text_list = [cell.content.strip() for cell in header_cells_sorted]
+
+            # (C) Let GPT figure out which column is circuit #, breaker trip, etc.
+            column_map = await self._ask_gpt_for_column_mapping(header_text_list)
+            if not column_map:
+                self.logger.warning("GPT returned empty column map. Skipping table.")
+                continue
+
+            # (D) Parse each subsequent row using the column map
+            for row_idx in range(header_row_idx + 1, table.row_count):
+                row_cells = [c for c in table.cells if c.row_index == row_idx]
+                row_cells_sorted = sorted(row_cells, key=lambda x: x.column_index)
+                circuit_obj = self._map_row_to_circuit(row_cells_sorted, column_map)
+                if circuit_obj:
+                    circuits.append(circuit_obj)
 
         return circuits
 
-    def _is_circuit_table(self, table) -> bool:
+    def _guess_header_row(self, table) -> int:
         """
-        Determine if a table looks like a circuit table by checking row 0 text
-        for keywords like 'circuit', 'breaker', 'amp', 'pole', 'load'.
+        Picks the row with the greatest total text length as the 'header row'.
+        Returns the row index, or -1 if none found.
         """
-        keywords = ["circuit", "breaker", "load", "amp", "pole"]
-        # Collect all cells in row 0
-        row0_cells = [c for c in table.cells if c.row_index == 0]
-        header_text = " ".join(c.content.lower() for c in row0_cells)
+        max_len = 0
+        candidate = -1
 
-        return any(keyword in header_text for keyword in keywords)
-
-    def _get_header_row(self, table) -> int:
-        """
-        Find a row that includes 'circuit' and either 'breaker' or 'load'.
-        If none is found, return -1.
-        """
         for row_idx in range(table.row_count):
             row_cells = [c for c in table.cells if c.row_index == row_idx]
-            row_text = " ".join(cell.content.lower() for cell in row_cells)
+            row_text = " ".join(cell.content.strip() for cell in row_cells)
+            if len(row_text) > max_len:
+                max_len = len(row_text)
+                candidate = row_idx
 
-            if "circuit" in row_text and ("breaker" in row_text or "load" in row_text):
-                return row_idx
+        return candidate
 
-        return -1
-
-    def _process_circuit_row(self, table, row_idx: int, header_row_idx: int) -> Dict:
+    async def _ask_gpt_for_column_mapping(self, header_text_list: List[str]) -> Dict[int, str]:
         """
-        Map each cell in the row to its 'header' cell. We rely on column_index to match them up.
-        Return a dictionary describing the circuit if we get a 'circuit number', else None.
+        Sends the header row’s column titles to GPT, asking for a JSON mapping:
+          {
+            "0": "ckt_number",
+            "1": "breaker_trip",
+            "2": "poles",
+            "3": "load_description",
+            ...
+          }
+        We convert that JSON into a Python dict {0: "ckt_number", ...}.
         """
-        row_cells = [c for c in table.cells if c.row_index == row_idx]
-        header_cells = [c for c in table.cells if c.row_index == header_row_idx]
+        system_prompt = (
+            "You are an expert at reading electrical panel schedule headers. "
+            "Given a list of column names for an electrical panel schedule, return a JSON mapping of "
+            "each column index (0-based) to a short semantic label. Example labels: "
+            "['ckt_number', 'breaker_trip', 'poles', 'load_description', 'voltage', 'phase', 'unused']. "
+            "If uncertain, label the column 'unused'. Return JSON only, with no extra text."
+        )
 
-        # Sort by column_index so they line up
-        row_cells_sorted = sorted(row_cells, key=lambda x: x.column_index)
-        header_cells_sorted = sorted(header_cells, key=lambda x: x.column_index)
+        user_prompt = (
+            f"Header columns:\n{json.dumps(header_text_list, indent=2)}\n\n"
+            f"Return JSON in the format: {{\"0\":\"ckt_number\",\"1\":\"poles\",...}}"
+        )
 
-        circuit = {
-            "number": "",
-            "poles": "",
-            "breaker_size": "",
-            "load_description": "",
-            "load_kva": "",
-            "phase": ""
-        }
-
-        # For each column, see if the header cell has a matching keyword
-        for col_idx, cell_data in enumerate(row_cells_sorted):
-            if col_idx < len(header_cells_sorted):
-                header_text = header_cells_sorted[col_idx].content.lower()
-                value = cell_data.content.strip()
-
-                if "circuit" in header_text or "no" in header_text:
-                    circuit["number"] = value
-                elif "pole" in header_text:
-                    circuit["poles"] = value
-                elif "breaker" in header_text or "amp" in header_text:
-                    circuit["breaker_size"] = value
-                elif "description" in header_text or "load" in header_text:
-                    circuit["load_description"] = value
-                elif "kva" in header_text:
-                    circuit["load_kva"] = value
-                elif "phase" in header_text:
-                    circuit["phase"] = value
-
-        return circuit if circuit["number"] else None
-
-    def _process_table_cell(self, parsed_data: Dict, text: str, table, cell):
-        """
-        Helper method to detect references like 'Main Panel', 'Distribution Panel', 'Load Center'.
-        We then grab the next cell's content (i.e., to the right) as the "panel name" or similar.
-        """
         try:
-            if "main" in text and "panel" in text:
-                parsed_data["MainPanel"]["panel"]["type"] = "MainPanel"
-                next_val = self._get_adjacent_cell_value(table, cell)
-                if next_val:
-                    parsed_data["MainPanel"]["panel"]["name"] = next_val
-            
-            elif "distribution" in text and "panel" in text:
-                parsed_data["DistributionPanel"]["panel"]["type"] = "DistributionPanel"
-                next_val = self._get_adjacent_cell_value(table, cell)
-                if next_val:
-                    parsed_data["DistributionPanel"]["panel"]["name"] = next_val
-            
-            elif "load center" in text:
-                parsed_data["LoadCenter"]["panelboard_schedule"]["designation"] = "LoadCenter"
-                next_val = self._get_adjacent_cell_value(table, cell)
-                if next_val:
-                    parsed_data["LoadCenter"]["panelboard_schedule"]["designation"] = next_val
+            # UPDATED: Use self.client instead of openai.ChatCompletion.acreate
+            response = await self.client.chat.completions.create(
+                model="gpt-4o-mini",  # keep your custom model
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=400,
+                temperature=0.0
+            )
+            content = response.choices[0].message.content.strip()
+
+            # Parse JSON into a Python dict
+            mapping_raw = json.loads(content)
+            column_map = {}
+            for k, v in mapping_raw.items():
+                col_idx = int(k)
+                column_map[col_idx] = v
+            return column_map
 
         except Exception as e:
-            self.logger.error(f"Error processing table cell: {str(e)}")
+            self.logger.error(f"GPT API call failed: {str(e)}")
+            return {}
 
-    def _get_adjacent_cell_value(self, table, cell) -> str:
+    def _map_row_to_circuit(self, row_cells_sorted: List, column_map: Dict[int, str]) -> Dict:
         """
-        Try to find the cell in the same row, next column over. If missing, return "".
-        Because table.cells is flat, filter by row_index then find column_index + 1.
+        For a single row, we create a circuit dict by looking up each cell’s column index in 'column_map'.
+        Returns None if the row is empty or if we can’t map anything meaningful.
         """
-        row_idx = cell.row_index
-        col_idx = cell.column_index + 1
+        circuit_obj = {}
+        meaningful = False
 
-        # Find a cell that matches (row_idx, col_idx)
-        next_cell = next(
-            (c for c in table.cells if c.row_index == row_idx and c.column_index == col_idx),
-            None
-        )
-        return next_cell.content.strip() if next_cell else ""
+        for i, cell in enumerate(row_cells_sorted):
+            text_val = cell.content.strip()
+            if i in column_map:
+                field_name = column_map[i]
+                # If GPT labeled it 'unused', skip
+                if field_name not in ("unused", ""):
+                    circuit_obj[field_name] = text_val
+                    if text_val:
+                        meaningful = True
 
-    # The revision or date processing can remain as-is or be removed if not needed.
+        return circuit_obj if meaningful else None
