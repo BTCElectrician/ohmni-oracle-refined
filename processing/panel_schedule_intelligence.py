@@ -1,85 +1,47 @@
 # processing/panel_schedule_intelligence.py
 
-from azure.core.credentials import AzureKeyCredential
-from azure.ai.documentintelligence import DocumentIntelligenceClient
 import os
 import logging
 import json
-from typing import Dict, List
 import re
+from typing import Dict, List, Any
 
-# NEW: Use the AsyncOpenAI client
+from azure.core.credentials import AzureKeyCredential
+from azure.ai.documentintelligence import DocumentIntelligenceClient
 from openai import AsyncOpenAI
-
-# Optional regex for typical panel name patterns like "L1", "H2", "A125", etc.
-PANEL_NAME_PATTERN = re.compile(r'^[A-Z]{1,3}\d{1,3}$')
 
 class PanelScheduleProcessor:
     """
-    Processes an electrical panel schedule PDF using:
-      1) Azure Document Intelligence (prebuilt-layout) to extract tables
-      2) GPT to interpret table columns (header row) and map them to circuit fields
+    A chunk-based approach: We split each recognized table into small row groups,
+    parse them with GPT individually, then unify the results into one panel object.
     """
 
     def __init__(self, endpoint: str, api_key: str, **kwargs):
-        """
-        :param endpoint: Azure Document Intelligence endpoint URL
-        :param api_key: Azure Document Intelligence API key
-        :param kwargs: optional arguments for config (batch_size, timeout, etc.)
-        """
         self.logger = logging.getLogger(__name__)
 
-        # Azure Document Intelligence client
+        # Azure Document Intelligence
         self.document_client = DocumentIntelligenceClient(
             endpoint=endpoint,
             credential=AzureKeyCredential(api_key)
         )
-
-        # GPT (OpenAI) configuration
+        # GPT
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         if not self.openai_api_key:
-            raise ValueError("OPENAI_API_KEY must be set for GPT usage.")
+            raise ValueError("OPENAI_API_KEY must be set in environment variables")
+        self.gpt_client = AsyncOpenAI(api_key=self.openai_api_key)
 
-        # NEW: Initialize the async OpenAI client
-        self.client = AsyncOpenAI(api_key=self.openai_api_key)
-
-        # Optional custom settings
-        self.batch_size = kwargs.get('batch_size', 1)
+        # Additional config
+        # You can tweak 'batch_size' to parse, say, 3 or 5 rows at a time.
+        self.batch_size = kwargs.get('batch_size', 5)
         self.timeout = kwargs.get('timeout', 300)
 
-    async def process_panel_schedule(self, file_path: str) -> Dict:
-        """
-        Main entry point: parse a panel schedule PDF into a structured dict.
-
-        Returns a structure like:
-        {
-          "PanelName": "L1",
-          "GenericPanelTypes": {
-             "LoadCenter": {...},
-             "MainPanel": {...},
-             "DistributionPanel": {...}
-          },
-          "circuits": [...],   # array of circuit objects
-          "error": None or "some error message"
-        }
-        """
-        fallback_output = {
-            "PanelName": "",
-            "GenericPanelTypes": {
-                "LoadCenter": {},
-                "MainPanel": {},
-                "DistributionPanel": {}
-            },
-            "circuits": [],
-            "error": None
-        }
-
+    async def process_panel_schedule(self, file_path: str) -> Dict[str, Any]:
+        fallback_output = {"panels": [], "error": None}
         try:
-            # Read the PDF file as bytes
             with open(file_path, "rb") as f:
                 pdf_bytes = f.read()
 
-            # 1) Analyze the PDF with Azure Document Intelligence (prebuilt-layout)
+            # 1) Analyze with Azure
             poller = self.document_client.begin_analyze_document(
                 "prebuilt-layout",
                 pdf_bytes,
@@ -88,198 +50,225 @@ class PanelScheduleProcessor:
             result = poller.result()
             self.logger.info(f"DEBUG: Azure analysis complete for {file_path}")
 
-            # 2) Extract any top-level panel data (like PanelName)
-            extracted_data = self._extract_panel_data(result)
+            if not hasattr(result, "tables") or not result.tables:
+                self.logger.warning("No tables found in PDF. Possibly no panel schedules?")
+                return {"panels": [], "error": None}
 
-            # 3) Use GPT to interpret each table’s header and map the data into circuit objects
-            circuit_info = await self._extract_circuit_data_with_gpt(result)
+            # We'll store multiple panel objects (one per recognized table)
+            raw_panels = []
+            for t_index, table in enumerate(result.tables):
+                panel_obj = await self._process_table_in_chunks(table, t_index+1)
+                if panel_obj:
+                    raw_panels.append(panel_obj)
 
-            final_output = {
-                "PanelName": extracted_data.get("PanelName", ""),
-                "GenericPanelTypes": {
-                    "LoadCenter": extracted_data.get("LoadCenter", {}),
-                    "MainPanel": extracted_data.get("MainPanel", {}),
-                    "DistributionPanel": extracted_data.get("DistributionPanel", {})
-                },
-                "circuits": circuit_info,
-                "error": None
-            }
-            return final_output
+            # If multiple panels share the same PanelName, unify them
+            merged_panels = self._merge_panels_by_name(raw_panels)
 
+            return {"panels": merged_panels, "error": None}
         except Exception as e:
-            self.logger.exception(f"Azure/GPT processing failed for {file_path}")
+            self.logger.exception(f"Error processing {file_path}: {e}")
             fallback_output["error"] = str(e)
             return fallback_output
 
-    def _extract_panel_data(self, result) -> Dict:
+    async def _process_table_in_chunks(self, table, table_number: int) -> Dict[str, Any]:
         """
-        Scans recognized tables for a possible panel name or any top-level data.
-        Returns a dict with:
-          "PanelName": "L1" (if found)
-          "LoadCenter": {...}, "MainPanel": {...}, "DistributionPanel": {...}
-        (You can expand or customize as needed.)
+        Split the table into small row-chunks, parse each chunk with GPT,
+        unify the results into a single panel object.
+        We'll guess or track a single panel name for the entire table, but
+        you can adapt if a single table has multiple panels.
         """
-        self.logger.info("DEBUG: Entering _extract_panel_data method")
+        # Convert table to rows
+        all_rows = self._extract_table_rows(table)
+        # Divide them in batches of self.batch_size
+        chunked_rows = []
+        for i in range(0, len(all_rows), self.batch_size):
+            chunk = all_rows[i:i+self.batch_size]
+            chunked_rows.append(chunk)
 
-        # Basic default structure
-        parsed_data = {
-            "PanelName": "",
-            "LoadCenter": {
-                "panelboard_schedule": {}
-            },
-            "MainPanel": {
-                "panel": {}
-            },
-            "DistributionPanel": {
-                "panel": {}
-            }
+        # We'll keep track of all circuits from all chunks
+        all_circuits = []
+        # Also track panel name / type if GPT mentions them
+        panel_name = ""
+        panel_type = ""
+        specifications = {}
+        dimensions = {}
+        panel_totals = {}
+
+        for c_index, chunk_rows in enumerate(chunked_rows):
+            # Convert chunk_rows to text
+            chunk_text = self._chunk_rows_to_text(chunk_rows)
+            # Call GPT
+            parse_result = await self._ask_gpt_for_rows(
+                chunk_text,
+                table_number,
+                chunk_index=(c_index+1)
+            )
+            # parse_result might have a partial "PanelName" or "circuits"
+
+            # Unify
+            if parse_result.get("PanelName"):
+                panel_name = panel_name or parse_result["PanelName"]
+            if parse_result.get("PanelType"):
+                panel_type = panel_type or parse_result["PanelType"]
+            if parse_result.get("circuits"):
+                all_circuits += parse_result["circuits"]
+
+            # specs/dims/panel_totals
+            for key in ["specifications","dimensions","panel_totals"]:
+                new_val = parse_result.get(key, {})
+                if new_val:  # if not empty
+                    if key == "specifications":
+                        specifications = {**specifications, **new_val}
+                    elif key == "dimensions":
+                        dimensions = {**dimensions, **new_val}
+                    elif key == "panel_totals":
+                        panel_totals = {**panel_totals, **new_val}
+
+        # Deduplicate circuits, unify them
+        all_circuits = self._deduplicate_circuits(all_circuits)
+
+        # Build final panel object
+        panel_obj = {
+            "PanelName": panel_name,
+            "PanelType": panel_type or "Other",
+            "circuits": all_circuits,
+            "specifications": specifications,
+            "dimensions": dimensions,
+            "panel_totals": panel_totals
         }
 
-        # If no tables recognized, nothing more we can do here
-        if not hasattr(result, "tables") or not result.tables:
-            self.logger.warning("No tables in result. No panel name found.")
-            return parsed_data
+        # Optionally skip if no circuits found
+        if not all_circuits and not panel_name:
+            return {}
 
-        # Optionally: Attempt to detect "PanelName" by scanning each cell with a regex
-        for table in result.tables:
-            for cell in table.cells:
-                text = cell.content.strip()
-                if PANEL_NAME_PATTERN.match(text):
-                    parsed_data["PanelName"] = text
-                    self.logger.info(f"Found panel name: {text}")
-                    # break after first match, or remove if you want multiple matches
-                    return parsed_data
+        return panel_obj
 
-        return parsed_data
-
-    async def _extract_circuit_data_with_gpt(self, result) -> List[Dict]:
+    def _extract_table_rows(self, table) -> List[List[str]]:
         """
-        Iterates over recognized tables. For each table:
-          1) Identify which row is likely the header row
-          2) Ask GPT to map those header columns to a known set of fields
-          3) Parse all subsequent rows into circuit objects using that mapping
-
-        Returns a list of circuit dictionaries.
+        Return a list of lists. Each sub-list is a row of text cells.
+        e.g. [ ["1-3-5", "CU-1.2", "50A"], ["2-4-6", "WH-1", "70A"] ]
         """
-        circuits = []
+        rows_data = [[] for _ in range(table.row_count)]
+        for cell in table.cells:
+            txt = cell.content.strip()
+            rows_data[cell.row_index].append(txt)
+        return rows_data
 
-        if not hasattr(result, "tables") or not result.tables:
-            self.logger.info("No tables found in result. Returning empty circuit list.")
-            return circuits
-
-        for t_idx, table in enumerate(result.tables):
-            self.logger.info(f"Analyzing table {t_idx} with row_count={table.row_count}, col_count={table.column_count}")
-
-            # (A) Choose a "header row"—here, we'll pick whichever row has the most text
-            header_row_idx = self._guess_header_row(table)
-            if header_row_idx < 0:
-                self.logger.info("No plausible header row. Skipping this table.")
-                continue
-
-            # (B) Gather the text of the header row into a list
-            header_cells = [c for c in table.cells if c.row_index == header_row_idx]
-            header_cells_sorted = sorted(header_cells, key=lambda x: x.column_index)
-            header_text_list = [cell.content.strip() for cell in header_cells_sorted]
-
-            # (C) Let GPT figure out which column is circuit #, breaker trip, etc.
-            column_map = await self._ask_gpt_for_column_mapping(header_text_list)
-            if not column_map:
-                self.logger.warning("GPT returned empty column map. Skipping table.")
-                continue
-
-            # (D) Parse each subsequent row using the column map
-            for row_idx in range(header_row_idx + 1, table.row_count):
-                row_cells = [c for c in table.cells if c.row_index == row_idx]
-                row_cells_sorted = sorted(row_cells, key=lambda x: x.column_index)
-                circuit_obj = self._map_row_to_circuit(row_cells_sorted, column_map)
-                if circuit_obj:
-                    circuits.append(circuit_obj)
-
-        return circuits
-
-    def _guess_header_row(self, table) -> int:
+    def _chunk_rows_to_text(self, chunk_rows: List[List[str]]) -> str:
         """
-        Picks the row with the greatest total text length as the 'header row'.
-        Returns the row index, or -1 if none found.
+        Convert a list of row-arrays into a small text snippet.
+        For example:
+          Row 1: 1-3-5 | CU-1.2 | 50A
+          Row 2: 2-4-6 | WH-1   | 70A
         """
-        max_len = 0
-        candidate = -1
+        lines = []
+        for r_index, row in enumerate(chunk_rows):
+            row_str = " | ".join(row)
+            lines.append(f"Row {r_index+1}: {row_str}")
+        return "\n".join(lines)
 
-        for row_idx in range(table.row_count):
-            row_cells = [c for c in table.cells if c.row_index == row_idx]
-            row_text = " ".join(cell.content.strip() for cell in row_cells)
-            if len(row_text) > max_len:
-                max_len = len(row_text)
-                candidate = row_idx
-
-        return candidate
-
-    async def _ask_gpt_for_column_mapping(self, header_text_list: List[str]) -> Dict[int, str]:
+    async def _ask_gpt_for_rows(self, rows_text: str, table_number: int, chunk_index: int) -> Dict[str, Any]:
         """
-        Sends the header row’s column titles to GPT, asking for a JSON mapping:
-          {
-            "0": "ckt_number",
-            "1": "breaker_trip",
-            "2": "poles",
-            "3": "load_description",
-            ...
-          }
-        We convert that JSON into a Python dict {0: "ckt_number", ...}.
+        Ask GPT to parse these chunked rows. Because each chunk is small,
+        GPT is less likely to skip or merge them incorrectly.
         """
         system_prompt = (
-            "You are an expert at reading electrical panel schedule headers. "
-            "Given a list of column names for an electrical panel schedule, return a JSON mapping of "
-            "each column index (0-based) to a short semantic label. Example labels: "
-            "['ckt_number', 'breaker_trip', 'poles', 'load_description', 'voltage', 'phase', 'unused']. "
-            "If uncertain, label the column 'unused'. Return JSON only, with no extra text."
+            "You are an expert at reading partial panel schedule rows.\n"
+            "You see a few rows from a panel schedule. Return a JSON with:\n"
+            "  'PanelName': (string, if found),\n"
+            "  'PanelType': (if found among the data),\n"
+            "  'circuits': an array of circuit objects with keys:\n"
+            "     circuit, load_name, trip, poles, connected_load (optional)\n"
+            "  'specifications': {}, 'dimensions': {}, 'panel_totals': {}\n"
+            "If the rows only have partial info, return what you can.\n"
+            "Do NOT unify duplicates across other chunks. Just parse these rows.\n"
+            "No extra text, only JSON.\n"
         )
 
         user_prompt = (
-            f"Header columns:\n{json.dumps(header_text_list, indent=2)}\n\n"
-            f"Return JSON in the format: {{\"0\":\"ckt_number\",\"1\":\"poles\",...}}"
+            f"TABLE {table_number}, CHUNK {chunk_index}:\n\n{rows_text}\n\n"
+            "Extract circuits from these rows, plus any panel name or type you find. Return valid JSON only."
         )
 
         try:
-            # UPDATED: Use self.client instead of openai.ChatCompletion.acreate
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",  # keep your custom model
+            resp = await self.gpt_client.chat.completions.create(
+                model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                max_tokens=400,
+                max_tokens=1000,
                 temperature=0.0
             )
-            content = response.choices[0].message.content.strip()
+            content = resp.choices[0].message.content.strip()
+            data = json.loads(content)
 
-            # Parse JSON into a Python dict
-            mapping_raw = json.loads(content)
-            column_map = {}
-            for k, v in mapping_raw.items():
-                col_idx = int(k)
-                column_map[col_idx] = v
-            return column_map
-
+            # Ensure structure
+            for key in ["PanelName","PanelType","circuits","specifications","dimensions","panel_totals"]:
+                if key not in data:
+                    if key == "circuits":
+                        data[key] = []
+                    elif key in ["specifications","dimensions","panel_totals"]:
+                        data[key] = {}
+                    else:
+                        data[key] = ""
+            return data
         except Exception as e:
-            self.logger.error(f"GPT API call failed: {str(e)}")
-            return {}
+            self.logger.error(f"GPT parse error (table {table_number}, chunk {chunk_index}): {e}")
+            return {
+                "PanelName": "",
+                "PanelType": "",
+                "circuits": [],
+                "specifications": {},
+                "dimensions": {},
+                "panel_totals": {}
+            }
 
-    def _map_row_to_circuit(self, row_cells_sorted: List, column_map: Dict[int, str]) -> Dict:
+    def _deduplicate_circuits(self, circuits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        For a single row, we create a circuit dict by looking up each cell’s column index in 'column_map'.
-        Returns None if the row is empty or if we can’t map anything meaningful.
+        Basic deduplicate logic. If GPT repeated the same circuit #, unify them.
+        Also cast circuit to string in case GPT gave an int.
         """
-        circuit_obj = {}
-        meaningful = False
+        final = []
+        seen = set()
 
-        for i, cell in enumerate(row_cells_sorted):
-            text_val = cell.content.strip()
-            if i in column_map:
-                field_name = column_map[i]
-                # If GPT labeled it 'unused', skip
-                if field_name not in ("unused", ""):
-                    circuit_obj[field_name] = text_val
-                    if text_val:
-                        meaningful = True
+        def norm(value):
+            # cast to string to avoid 'int' object has no attribute 'lower'
+            s = str(value)
+            return s.lower().replace(" ","")
 
-        return circuit_obj if meaningful else None
+        for c in circuits:
+            circuit_val = c.get("circuit","")
+            c_str = norm(circuit_val)
+            if c_str in seen:
+                continue
+            seen.add(c_str)
+            final.append(c)
+        return final
+
+    def _merge_panels_by_name(self, raw_panels: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
+        """
+        If multiple tables produce the same PanelName, unify them by name.
+        """
+        merged_dict = {}
+        for p in raw_panels:
+            name = p.get("PanelName","Unknown").strip()
+            key = name.lower() or "unknown"
+            if key not in merged_dict:
+                merged_dict[key] = p
+            else:
+                existing = merged_dict[key]
+                # merge circuits
+                existing["circuits"] += p["circuits"]
+                existing["circuits"] = self._deduplicate_circuits(existing["circuits"])
+                # Merge specs, etc.
+                for k in ["specifications","dimensions","panel_totals"]:
+                    merged_val = {**existing.get(k, {}), **p.get(k, {})}
+                    existing[k] = merged_val
+                # fill name/type if missing
+                if not existing["PanelName"] and p["PanelName"]:
+                    existing["PanelName"] = p["PanelName"]
+                if existing["PanelType"]=="Other" and p["PanelType"]!="Other":
+                    existing["PanelType"] = p["PanelType"]
+                merged_dict[key] = existing
+        return list(merged_dict.values())
