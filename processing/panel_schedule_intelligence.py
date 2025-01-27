@@ -33,23 +33,18 @@ class PanelScheduleProcessor:
             self.logger.debug(f"Processing: {file_path}")
             
             with open(file_path, "rb") as f:
-                document_bytes = f.read()
-                
-            poller = self.client.begin_analyze_document(
-                model_id="prebuilt-layout",
-                document=document_bytes,  # Changed from file_stream to document
-                content_type="application/pdf",
-                features=[DocumentAnalysisFeature.OCR_HIGH_RESOLUTION]
-            )
+                poller = self.client.begin_analyze_document(
+                    "prebuilt-layout",
+                    document=f,
+                    content_type="application/pdf"
+                )
             
             result = poller.result()
             self.logger.debug("Azure Document Intelligence completed successfully.")
 
-            # Extract text with logging
             raw_content = self._extract_azure_read_text(result)
             self.logger.debug(f"raw_content length: {len(raw_content)} characters")
 
-            # Call GPT with logging
             structured_json = await self._call_gpt_for_structuring(raw_content, gpt_client)
             self.logger.debug(f"GPT returned a dict with keys: {list(structured_json.keys())}")
 
