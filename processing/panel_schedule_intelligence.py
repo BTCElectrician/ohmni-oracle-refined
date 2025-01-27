@@ -6,6 +6,7 @@ import os
 import json
 from typing import Dict
 from openai import AsyncOpenAI
+from azure.ai.documentintelligence.models import DocumentAnalysisFeature
 
 class PanelScheduleProcessor:
     """
@@ -22,28 +23,27 @@ class PanelScheduleProcessor:
 
     async def process_panel_schedule(self, file_path: str, gpt_client: AsyncOpenAI) -> Dict:
         """
-        1) Use 'prebuilt-read' to perform OCR on the PDF.
+        1) Use 'prebuilt-layout' to perform OCR on the PDF.
         2) Concatenate recognized text into raw_content.
         3) Pass raw_content to GPT to produce structured JSON.
         """
         fallback_output = {"panel": {}, "circuits": [], "error": None}
 
         try:
-            # Add debug logging for start and file size
-            self.logger.debug(f"Starting process_panel_schedule for: {file_path}")
+            self.logger.debug(f"Processing: {file_path}")
+            
             with open(file_path, "rb") as f:
                 document_bytes = f.read()
-            self.logger.debug(f"PDF size (bytes): {len(document_bytes)}")
-
-            # Log Azure API call with correct AnalyzeDocumentRequest
-            request = AnalyzeDocumentRequest(bytes_source=document_bytes)
+                
             poller = self.client.begin_analyze_document(
-                "prebuilt-read",
-                request,
-                content_type="application/pdf"
+                model_id="prebuilt-layout",
+                document=document_bytes,  # Changed from file_stream to document
+                content_type="application/pdf",
+                features=[DocumentAnalysisFeature.OCR_HIGH_RESOLUTION]
             )
+            
             result = poller.result()
-            self.logger.debug("Azure prebuilt-read completed successfully.")
+            self.logger.debug("Azure Document Intelligence completed successfully.")
 
             # Extract text with logging
             raw_content = self._extract_azure_read_text(result)
