@@ -75,8 +75,11 @@ async def process_pdf_async(
                 logging.info(f"Detected electrical panel schedule in {file_name}. Using Azure Document Intelligence.")
                 
                 try:
-                    # Process with Azure Document Intelligence
-                    panel_data = await panel_processor.process_panel_schedule(pdf_path)
+                    # Process with Azure Document Intelligence, now passing the GPT client
+                    panel_data = await panel_processor.process_panel_schedule(
+                        file_path=pdf_path,
+                        gpt_client=client
+                    )
                     pbar.update(40)  # Azure processing done
                     
                     # Save to PanelSchedules subfolder
