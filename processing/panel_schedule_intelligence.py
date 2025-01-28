@@ -1,127 +1,111 @@
 import logging
 import os
 import json
-from typing import Dict, List
+from typing import Dict
 
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
+# from azure.ai.documentintelligence.models import DocumentAnalysisFeature  # No longer needed
 
 class PanelScheduleProcessor:
     """
-    A minimal approach to ensure we capture *all* text from a PDF recognized as
-    a 'panel schedule,' WITHOUT using GPT at all. This eliminates issues with
-    malformed JSON or chunking errors from GPT.
-
-    Steps:
-      1. 'prebuilt-read' to extract all text
-      2. Split text into ~5000-char chunks (to keep the final JSON from being massive)
-      3. Return a final JSON with those chunks
+    Processes an electrical panel schedule using Azure Document Intelligence (GA 1.0.0).
+    It automatically extracts tables when using the 'prebuilt-layout' model.
     """
 
     def __init__(self, endpoint: str, api_key: str, **kwargs):
-        """
-        Args:
-            endpoint (str): e.g. "https://<region>.api.cognitive.microsoft.com/"
-            api_key (str): Your Azure Document Intelligence API key
-        """
         self.client = DocumentIntelligenceClient(
             endpoint=endpoint,
             credential=AzureKeyCredential(api_key)
         )
         self.logger = logging.getLogger(__name__)
 
-        # You can adjust how big each chunk is
-        self.max_chars_per_chunk = 5000
-
     def process_panel_schedule(self, file_path: str) -> Dict:
         """
-        Main pipeline:
-          - Use 'prebuilt-read' to OCR the PDF
-          - Split the text into chunks of ~5000 characters
-          - Return a JSON-like dict with all chunks
-
-        Returns:
-          {
-            "file_name": "<filename>",
-            "extracted_chunks": [
-              { "chunk_index": 1, "chunk_text": "..." },
-              { "chunk_index": 2, "chunk_text": "..." },
-              ...
-            ]
-          }
+        1) Opens the PDF file
+        2) Analyzes with the 'prebuilt-layout' model
+           (no 'features' parameter needed in GA 1.0.0)
+        3) Pulls out table data (and styles if available)
+        4) Returns a JSON-like dictionary
         """
-        # We'll build this fallback if something fails
+
+        # Basic output structure, including an error field for fallback
         fallback_output = {
             "file_name": os.path.basename(file_path),
-            "extracted_chunks": [],
+            "extracted_tables": [],
+            "extracted_styles": [],
             "error": None
         }
         try:
-            self.logger.info(f"Processing potential panel schedule: {file_path}")
+            self.logger.info(f"Processing panel schedule: {file_path}")
 
             # 1) Read PDF bytes
             with open(file_path, "rb") as f:
                 pdf_bytes = f.read()
 
-            # 2) Analyze with 'prebuilt-read' from azure-ai-documentintelligence==1.0.0
+            # 2) Analyze using "prebuilt-layout" 
+            #    (In v1.0.0, the argument is `document=pdf_bytes` rather than `analyze_request=...`)
             poller = self.client.begin_analyze_document(
-                model_id="prebuilt-read",
-                body=pdf_bytes,
-                content_type="application/pdf"
+                model_id="prebuilt-layout",
+                document=pdf_bytes,
+                content_type="application/octet-stream"
             )
             result = poller.result()
-            self.logger.info("Azure Document Intelligence completed successfully.")
 
-            # 3) Extract text
-            raw_content = self._extract_azure_read_text(result)
-            self.logger.info(f"Extracted PDF content length: {len(raw_content)} characters")
+            # 3A) Pull out table data
+            tables_data = []
+            if hasattr(result, "tables") and result.tables:  # be safe checking
+                self.logger.info(f"Found {len(result.tables)} table(s) in document.")
+                for table_idx, table in enumerate(result.tables):
+                    # Log a quick summary
+                    self.logger.debug(
+                        f"Table {table_idx}: {table.row_count} rows x {table.column_count} columns"
+                    )
 
-            # 4) Split into chunks
-            chunks = self._chunk_text(raw_content, self.max_chars_per_chunk)
-            self.logger.info(f"Split OCR text into {len(chunks)} chunk(s).")
+                    table_rows = []
+                    for cell in table.cells:
+                        # Make sure the list is big enough
+                        while len(table_rows) <= cell.row_index:
+                            table_rows.append([])
 
-            # 5) Build final JSON
+                        table_rows[cell.row_index].append(cell.content)
+
+                    # Optional: Log the first row snippet
+                    if table_rows and len(table_rows[0]) > 0:
+                        snippet = " | ".join(table_rows[0])
+                        self.logger.debug(
+                            f"Table {table_idx} first row snippet: {snippet[:100]}"
+                        )
+
+                    tables_data.append({
+                        "table_index": table_idx,
+                        "row_count": table.row_count,
+                        "column_count": table.column_count,
+                        "rows": table_rows
+                    })
+
+            # 3B) Pull out style data (if it exists in v1.0.0)
+            styles_data = []
+            if hasattr(result, "styles") and result.styles:
+                for style_idx, style in enumerate(result.styles):
+                    # We'll just store a small subset for demonstration
+                    styles_data.append({
+                        "style_index": style_idx,
+                        "is_bold": style.is_bold,
+                        "is_italic": style.is_italic,
+                        "color": style.color,
+                        "font_size": style.font_size
+                    })
+
+            # Build final JSON-like output
             final_result = {
                 "file_name": os.path.basename(file_path),
-                "extracted_chunks": [],
+                "extracted_tables": tables_data,
+                "extracted_styles": styles_data
             }
-            for i, chunk_text in enumerate(chunks, start=1):
-                final_result["extracted_chunks"].append({
-                    "chunk_index": i,
-                    "chunk_text": chunk_text
-                })
-
             return final_result
 
         except Exception as e:
             self.logger.exception(f"Failed to process panel schedule: {e}")
             fallback_output["error"] = str(e)
             return fallback_output
-
-    def _extract_azure_read_text(self, result) -> str:
-        """
-        Extract text from the 'prebuilt-read' result object.
-        Returns a single string with all lines from all pages.
-        """
-        if not result or not getattr(result, "pages", None):
-            self.logger.warning("No pages found in the DocumentIntelligence result.")
-            return ""
-
-        all_lines = []
-        for page in result.pages:
-            for line in page.lines:
-                all_lines.append(line.content)
-        return "\n".join(all_lines)
-
-    def _chunk_text(self, text: str, max_chars: int) -> List[str]:
-        """
-        Splits a large string into multiple segments, each up to max_chars long.
-        """
-        chunks = []
-        start_idx = 0
-        while start_idx < len(text):
-            end_idx = start_idx + max_chars
-            chunk = text[start_idx:end_idx]
-            chunks.append(chunk)
-            start_idx = end_idx
-        return chunks
