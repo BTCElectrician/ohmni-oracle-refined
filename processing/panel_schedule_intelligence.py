@@ -5,7 +5,7 @@ from typing import Dict
 
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
-# from azure.ai.documentintelligence.models import DocumentAnalysisFeature  # No longer needed
+from azure.ai.documentintelligence.models import AnalyzeDocumentRequest  # <-- ADD THIS IMPORT
 
 class PanelScheduleProcessor:
     """
@@ -24,11 +24,9 @@ class PanelScheduleProcessor:
         """
         1) Opens the PDF file
         2) Analyzes with the 'prebuilt-layout' model
-           (no 'features' parameter needed in GA 1.0.0)
         3) Pulls out table data (and styles if available)
         4) Returns a JSON-like dictionary
         """
-
         # Basic output structure, including an error field for fallback
         fallback_output = {
             "file_name": os.path.basename(file_path),
@@ -43,18 +41,18 @@ class PanelScheduleProcessor:
             with open(file_path, "rb") as f:
                 pdf_bytes = f.read()
 
-            # 2) Analyze using "prebuilt-layout" 
-            #    (In v1.0.0, the argument is `document=pdf_bytes` rather than `analyze_request=...`)
+            # 2) Analyze using "prebuilt-layout" (GA 1.0 syntax)
             poller = self.client.begin_analyze_document(
-                model_id="prebuilt-layout",
-                document=pdf_bytes,
-                content_type="application/octet-stream"
+                "prebuilt-layout",
+                AnalyzeDocumentRequest(
+                    base64_source=pdf_bytes
+                )
             )
             result = poller.result()
 
             # 3A) Pull out table data
             tables_data = []
-            if hasattr(result, "tables") and result.tables:  # be safe checking
+            if hasattr(result, "tables") and result.tables:
                 self.logger.info(f"Found {len(result.tables)} table(s) in document.")
                 for table_idx, table in enumerate(result.tables):
                     # Log a quick summary
