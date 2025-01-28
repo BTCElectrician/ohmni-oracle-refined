@@ -1,5 +1,3 @@
-# File: processing/panel_schedule_intelligence.py
-
 import logging
 import os
 import json
@@ -25,7 +23,7 @@ class PanelScheduleProcessor:
     def process_panel_schedule(self, file_path: str) -> Dict:
         """
         1) Opens the PDF file
-        2) Analyzes with the 'prebuilt-document' model
+        2) Analyzes with the 'prebuilt-layout' model
         3) Pulls out table data (and styles if available)
         4) Returns a JSON-like dictionary
         """
@@ -44,17 +42,15 @@ class PanelScheduleProcessor:
             with open(file_path, "rb") as f:
                 pdf_bytes = f.read()
 
-            # 2) Analyze using "prebuilt-document" (GA 1.0 syntax)
+            # 2) Analyze using "prebuilt-layout" (GA 1.0 syntax)
             #    Pass your PDF bytes as 'body', set content_type to 'application/pdf'.
             poller = self.client.begin_analyze_document(
-                model_id="prebuilt-document",
+                model_id="prebuilt-layout",
                 body=pdf_bytes,
                 content_type="application/pdf",
                 # Optionally, choose which features to enable:
                 features=[
-                    DocumentAnalysisFeature.TABLES,
-                    DocumentAnalysisFeature.KEY_VALUE_PAIRS,
-                    DocumentAnalysisFeature.FIGURES
+                    DocumentAnalysisFeature.KEY_VALUE_PAIRS
                 ],
                 # You can also limit pages or set locale if needed, for example:
                 # pages="1-",
