@@ -10,7 +10,7 @@ from azure.ai.documentintelligence.models import DocumentAnalysisFeature
 class PanelScheduleProcessor:
     """
     Processes an electrical panel schedule using Azure Document Intelligence (GA 1.0.0).
-    It automatically extracts tables and other layout info using the 'prebuilt-document' model.
+    It automatically extracts layout info using the 'prebuilt-layout' model.
     """
 
     def __init__(self, endpoint: str, api_key: str, **kwargs):
@@ -24,7 +24,7 @@ class PanelScheduleProcessor:
         """
         1) Opens the PDF file
         2) Analyzes with the 'prebuilt-layout' model
-        3) Pulls out table data (and styles if available)
+        3) Pulls out table data and styles
         4) Returns a JSON-like dictionary
         """
         # Basic output structure, including an error field for fallback
@@ -90,16 +90,16 @@ class PanelScheduleProcessor:
                         "rows": table_rows
                     })
 
-            # 3B) Pull out style data (if available)
+            # 3B) Pull out style data (with updated properties for SDK 2024-11-30)
             styles_data = []
             if hasattr(result, "styles") and result.styles:
                 for style_idx, style in enumerate(result.styles):
                     styles_data.append({
                         "style_index": style_idx,
-                        "is_bold": style.is_bold,
-                        "is_italic": style.is_italic,
-                        "color": style.color,
-                        "font_size": style.font_size
+                        "font_weight": style.font_weight,  # "normal" or "bold"
+                        "font_style": style.font_style,    # "normal" or "italic"
+                        "is_handwritten": style.is_handwritten,
+                        "confidence": style.confidence
                     })
 
             # Build final JSON-like output
