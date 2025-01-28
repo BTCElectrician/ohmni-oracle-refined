@@ -1,62 +1,97 @@
 import logging
 import os
 import json
-from typing import Dict
+from typing import Dict, List
 
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
-from openai import AsyncOpenAI
-
-# Remove old imports related to preview versions:
-# from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
-# from azure.ai.documentintelligence.models import DocumentAnalysisFeature
 
 class PanelScheduleProcessor:
     """
-    Azure Document Intelligence processor specifically for electrical panel schedules.
-    Uses 'prebuilt-layout' to extract text, then GPT to structure it.
+    A minimal approach to ensure we capture *all* text from a PDF recognized as
+    a 'panel schedule,' WITHOUT using GPT at all. This eliminates issues with
+    malformed JSON or chunking errors from GPT.
+
+    Steps:
+      1. 'prebuilt-read' to extract all text
+      2. Split text into ~5000-char chunks (to keep the final JSON from being massive)
+      3. Return a final JSON with those chunks
     """
 
     def __init__(self, endpoint: str, api_key: str, **kwargs):
+        """
+        Args:
+            endpoint (str): e.g. "https://<region>.api.cognitive.microsoft.com/"
+            api_key (str): Your Azure Document Intelligence API key
+        """
         self.client = DocumentIntelligenceClient(
             endpoint=endpoint,
             credential=AzureKeyCredential(api_key)
         )
         self.logger = logging.getLogger(__name__)
 
-    async def process_panel_schedule(self, file_path: str, gpt_client: AsyncOpenAI) -> Dict:
-        """
-        1) Use 'prebuilt-layout' to perform OCR on the PDF.
-        2) Concatenate recognized text into raw_content.
-        3) Pass raw_content to GPT to produce structured JSON.
-        """
-        fallback_output = {"panel": {}, "circuits": [], "error": None}
+        # You can adjust how big each chunk is
+        self.max_chars_per_chunk = 5000
 
+    def process_panel_schedule(self, file_path: str) -> Dict:
+        """
+        Main pipeline:
+          - Use 'prebuilt-read' to OCR the PDF
+          - Split the text into chunks of ~5000 characters
+          - Return a JSON-like dict with all chunks
+
+        Returns:
+          {
+            "file_name": "<filename>",
+            "extracted_chunks": [
+              { "chunk_index": 1, "chunk_text": "..." },
+              { "chunk_index": 2, "chunk_text": "..." },
+              ...
+            ]
+          }
+        """
+        # We'll build this fallback if something fails
+        fallback_output = {
+            "file_name": os.path.basename(file_path),
+            "extracted_chunks": [],
+            "error": None
+        }
         try:
-            self.logger.debug(f"Processing: {file_path}")
+            self.logger.info(f"Processing potential panel schedule: {file_path}")
 
-            # 1) Read the PDF as bytes
+            # 1) Read PDF bytes
             with open(file_path, "rb") as f:
-                document_bytes = f.read()
+                pdf_bytes = f.read()
 
-            # 2) Call begin_analyze_document with analyze_request=
+            # 2) Analyze with 'prebuilt-read' from azure-ai-documentintelligence==1.0.0
             poller = self.client.begin_analyze_document(
-                model_id="prebuilt-layout",      # first positional argument
-                analyze_request=document_bytes,  # correct param for v1.0.0
+                model_id="prebuilt-read",
+                body=pdf_bytes,
                 content_type="application/pdf"
             )
             result = poller.result()
-            self.logger.debug("Azure Document Intelligence completed successfully.")
+            self.logger.info("Azure Document Intelligence completed successfully.")
 
-            # 3) Extract recognized text
+            # 3) Extract text
             raw_content = self._extract_azure_read_text(result)
-            self.logger.debug(f"raw_content length: {len(raw_content)} characters")
+            self.logger.info(f"Extracted PDF content length: {len(raw_content)} characters")
 
-            # 4) Pass extracted text to GPT to get structured JSON
-            structured_json = await self._call_gpt_for_structuring(raw_content, gpt_client)
-            self.logger.debug(f"GPT returned a dict with keys: {list(structured_json.keys()) if isinstance(structured_json, dict) else 'N/A'}")
+            # 4) Split into chunks
+            chunks = self._chunk_text(raw_content, self.max_chars_per_chunk)
+            self.logger.info(f"Split OCR text into {len(chunks)} chunk(s).")
 
-            return structured_json
+            # 5) Build final JSON
+            final_result = {
+                "file_name": os.path.basename(file_path),
+                "extracted_chunks": [],
+            }
+            for i, chunk_text in enumerate(chunks, start=1):
+                final_result["extracted_chunks"].append({
+                    "chunk_index": i,
+                    "chunk_text": chunk_text
+                })
+
+            return final_result
 
         except Exception as e:
             self.logger.exception(f"Failed to process panel schedule: {e}")
@@ -65,56 +100,28 @@ class PanelScheduleProcessor:
 
     def _extract_azure_read_text(self, result) -> str:
         """
-        Extracts text from the Document Intelligence result object (prebuilt-layout).
-        Returns a single string containing all lines from all pages.
+        Extract text from the 'prebuilt-read' result object.
+        Returns a single string with all lines from all pages.
         """
-        all_text = []
         if not result or not getattr(result, "pages", None):
             self.logger.warning("No pages found in the DocumentIntelligence result.")
             return ""
 
-        self.logger.debug(f"Number of pages found: {len(result.pages)}")
-        for page_index, page in enumerate(result.pages):
-            self.logger.debug(f"Page {page_index+1} has {len(page.lines)} lines.")
+        all_lines = []
+        for page in result.pages:
             for line in page.lines:
-                all_text.append(line.content)
-        return "\n".join(all_text)
+                all_lines.append(line.content)
+        return "\n".join(all_lines)
 
-    async def _call_gpt_for_structuring(self, raw_content: str, gpt_client: AsyncOpenAI) -> Dict:
+    def _chunk_text(self, text: str, max_chars: int) -> List[str]:
         """
-        Calls GPT with instructions to produce structured JSON from raw panel schedule text.
+        Splits a large string into multiple segments, each up to max_chars long.
         """
-        system_prompt = (
-            "You are an expert in electrical engineering who structures panel schedule data into JSON. "
-            "Please parse the raw OCR text and produce a well-formed JSON object. "
-            "Include fields like 'panel name', 'voltage', 'feed', 'circuits', 'trip rating', 'load name', 'phases', "
-            "'amps', 'amperage', etc. The content may vary, so be flexible when naming fields. Use only JSON in your final output."
-        )
-
-        user_prompt = (
-            f"Raw OCR text (first 500 chars shown):\n{raw_content[:500]}...\n\n"
-            "Please structure this into valid JSON. Be flexible with circuit naming."
-        )
-
-        self.logger.debug("Sending prompt to GPT.")
-        try:
-            response = await gpt_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.2,
-                max_tokens=3000
-            )
-            content = response.choices[0].message.content
-            self.logger.debug(f"GPT raw response (first 200 chars): {content[:200]}...")
-            return json.loads(content)
-        except Exception as e:
-            self.logger.error(f"Error calling GPT to structure data: {str(e)}")
-            return {
-                "panel": {},
-                "circuits": [],
-                "raw_gpt_output": "",
-                "error": str(e)
-            }
+        chunks = []
+        start_idx = 0
+        while start_idx < len(text):
+            end_idx = start_idx + max_chars
+            chunk = text[start_idx:end_idx]
+            chunks.append(chunk)
+            start_idx = end_idx
+        return chunks
